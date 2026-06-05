@@ -1,222 +1,289 @@
-### EARLY DEVELOPMENT STAGE
+# 🌿 dBranch — PostgreSQL Branching System
 
-> dBranch is currently in the early development stage. While the core functionality is implemented, there may be bugs and missing features. We welcome contributions and feedback from the community to help improve the project.
+> **Early development** — works but expect rough edges.  
+> **Don't use in production.**
 
-### *PLEASE DO NOT USE IN PRODUCTION*
+dBranch makes it trivial to run multiple Postgres databases locally with
+**instant branching** (copy-on-write snapshots), each branch in its own
+container on its own port, plus a **transparent TCP proxy** that routes
+`localhost:5432` to whichever branch is currently active.
+
+Two ways to drive it: a **CLI** for scripts/automation and a **Web UI** for
+day-to-day exploration. Both expose the same operations.
+
 ---
 
-## 🌿 dBranch - PostgreSQL Database Branching System
+## What it gives you
 
-dBranch is a database branching system designed for PostgreSQL that empowers developers to effortlessly create, manage, and switch between multiple database branches.
+- **Multi-project** — multiple Postgres projects side-by-side, each on its own port range. Switch the proxy between them without touching connection strings.
+- **CoW branching** — `dbranch create feature` snapshots `main`'s data via `copy_file_range(2)` on Linux / `clonefile(2)` on macOS. Storage is shared until divergence.
+- **Schema introspection + diff** — see tables, columns, FKs, indexes for any branch; compare two branches side-by-side with an interactive ER diagram (drag/zoom/auto-layout).
+- **Ad-hoc SQL terminal** — run queries in the browser with table-name autocomplete; results tabulated, errors surfaced clearly.
+- **Live resource usage** — CPU / memory / network / disk I/O per branch, polled from `docker stats`.
+- **Logs** — dBranch's own server logs AND per-container Postgres logs in the UI.
+- **Dump / import** — `pg_dump`/`pg_restore` via the CLI or streamed through the Web UI (auto-detects plain vs custom format).
 
-Its key features include Instant Database Branching, which allows for the creation of lightweight branches using copy-on-write. This approach makes the system highly Resource Efficient, as all branches share common data blocks, dramatically minimizing storage overhead.
+---
 
-For isolation and stability, each branch operates within its own Isolated Environment—a dedicated Docker container that ensures no interference between branches and provides unique network ports.
+## Prerequisites
 
-Furthermore, dBranch includes a Transparent Proxy that enables seamless context switching between different database branches without requiring any changes to the application's connection string, streamlining the development workflow.
+- **Docker** (or Docker Desktop) running.
+- **Rust 1.80+** if you're building from source.
+- A reflink-capable filesystem for true CoW efficiency: APFS (macOS),
+  BTRFS / XFS / ext4-with-CoW (Linux). Without that, branches still work
+  but data is copied byte-for-byte.
+
+## Install / build
+
+```bash
+git clone https://github.com/Lab2021/dbranch.git
+cd dbranch
+cargo build --release
+# Binary at ./target/release/dbranch
+```
+
+---
+
+## Quick start — Web UI
+
+```bash
+dbranch start
+# Open http://localhost:8000   (or run `dbranch ui`)
+```
+
+`dbranch start` boots two listeners:
+- **Postgres proxy** on `:5432` — routes to the active branch.
+- **Web UI + JSON API** on `:8000`.
+
+On a fresh install the registry is empty — the UI shows a "create your
+first project" prompt. Click **+ New Project**, give it a name and a data
+directory (default: `$HOME/dbranch`), and you're done.
+
+From there:
+- **Projects list** — each project is a card with the proxy connection URL
+  (with copy / reveal password), proxy + API ports, mini CPU/memory bars
+  for `main`, and Start/Stop-all buttons.
+- **Project page** — branches table, "+ New Branch", per-project Resources
+  panel.
+- **Branch page** — overview + tile grid of tools:
+  - **Schema** — tables / columns / FKs / indexes, with "Compare with…"
+    dropdown for a side-by-side diff. Diagram view (Mermaid-style ER) has
+    Fit / Zoom / Rearrange buttons, drag tables freely, edges re-route
+    automatically. Toggle "Show diff" to focus on just the current branch.
+  - **Query** — small SQL terminal: textarea + ⌘↵ to run, table-name
+    autocomplete, results in a sortable-ish table. Errors include
+    Postgres' `LINE N` context.
+  - **Logs** — live container logs, auto-refresh.
+  - **Dump / Import** — direct download / upload, streamed (handles GB-sized
+    dumps).
+- **Server logs** — link in the header. dBranch's own tracing output,
+  buffered in memory.
+
+Everything routes via hash URLs (`#/projects/foo/branches/main/query`),
+so the browser back button works and you can share or bookmark links.
+
+---
+
+## Quick start — CLI
+
+```bash
+# 1. Register a project (becomes the registry default automatically)
+dbranch init -n my_app
+
+# 2. Bring up its main Postgres container
+dbranch init-postgres
+
+# 3. Branch off main
+dbranch create feature-x
+
+# 4. Switch the proxy at :5432 to feature-x
+dbranch use feature-x
+
+# 5. Open psql (interactive)
+dbranch psql feature-x
+
+# 6. One-shot query
+dbranch query feature-x "SELECT count(*) FROM users"
+
+# 7. Get the connection string
+dbranch url feature-x
+# postgresql://dbranch_user:dbranch_password@127.0.0.1:7001/dbranch
+
+# 8. Live resource usage
+dbranch resources
+
+# 9. Dump / restore
+dbranch dump  feature-x -o /tmp/snapshot.dump
+dbranch import feature-x -i /tmp/snapshot.dump
+
+# 10. Inspect schema
+dbranch schema feature-x                       # tables/columns/FKs/indexes
+dbranch schema feature-x --diff-against main   # what changed vs main
+```
+
+### Multiple projects
+
+```bash
+dbranch -p other_project status
+dbranch -p other_project create staging
+```
+
+Use `--project` (or `DBRANCH_PROJECT=...`) to address a project other than
+the registry default. All containers can run simultaneously — each branch
+gets its own host port from the project's range. Only one project owns the
+`:5432` proxy slot per `dbranch start` process.
+
+### CLI reference
+
+| Command                          | Purpose                                                                |
+|----------------------------------|------------------------------------------------------------------------|
+| `start`                          | Boot the proxy (`:5432`) + Web UI / API (`:8000`).                     |
+| `ui`                             | Open the Web UI in the default browser (falls back to printing the URL).|
+| `init -n <name>`                 | Register a new project; sets it as the registry default.               |
+| `init-postgres`                  | Spawn the project's `main` Postgres container.                         |
+| `create <branch> [-s <source>]`  | CoW branch off `<source>` (defaults to `main`).                        |
+| `use <branch>`                   | Make `<branch>` the active one — proxy routes here.                    |
+| `list`                           | List all registered projects with branch / running counts.             |
+| `status`                         | Detailed table of the current project's branches.                      |
+| `show <branch>`                  | Single-branch detail (port, size, container state, URL).               |
+| `delete <branch>`                | Drop a branch's container + data (refuses `main` and the active one).  |
+| `delete-project <name>`          | Drop the whole project (containers + data + registry entry).           |
+| `stop` / `resume`                | Stop / resume every container in the project (idempotent).             |
+| `dump <branch> [-o file] [-f fmt]` | `pg_dump` to a host file. Formats: `custom` (default), `plain`, `tar`. |
+| `import <branch> -i file [--mode reset\|merge] [--allow-main]` | `pg_restore` / `psql` (auto-detects format). |
+| `psql <branch>`                  | Drop into an interactive `psql` shell against the branch.              |
+| `url <branch>`                   | Print the postgresql:// connection URL.                                |
+| `query <branch> "<sql>"` / `-f file` | Run one SQL statement (10s timeout, results capped at 1000 rows).  |
+| `schema <branch> [--diff-against <other>]` | Print schema or a diff between two branches.                |
+| `logs [<branch>] [--tail N] [--server]` | Tail a branch's container logs, or dBranch's own (`--server`). |
+| `resources`                      | Live CPU / memory / network / disk I/O per running branch.             |
+
+All commands accept the global `-p/--project` flag.
+
+---
+
+## Web API
+
+The same surface the UI uses. All endpoints under `/api/`, JSON in/out:
+
+```
+GET    /api/status                              # overview of every project
+GET    /api/defaults                            # suggested mount_point + pg creds
+GET    /api/logs                                # dBranch server logs (ring buffer)
+
+GET    /api/projects                            POST   /api/projects
+GET    /api/projects/:p                         PATCH  /api/projects/:p    DELETE /api/projects/:p
+GET    /api/projects/:p/branches                POST   /api/projects/:p/branches
+GET    /api/projects/:p/branches/:b             DELETE /api/projects/:p/branches/:b
+POST   /api/projects/:p/branches/:b/start       (idempotent — docker start if exists)
+POST   /api/projects/:p/branches/:b/stop
+POST   /api/projects/:p/active                  # body: {branch: "..."}
+GET    /api/projects/:p/branches/:b/schema
+GET    /api/projects/:p/branches/:b/schema/diff?against=<other>
+POST   /api/projects/:p/branches/:b/query       # body: {sql: "..."}
+GET    /api/projects/:p/branches/:b/logs?tail=N
+GET    /api/projects/:p/branches/:b/dump?format=custom    # streams pg_dump output
+POST   /api/projects/:p/branches/:b/import      # multipart `file`
+POST   /api/projects/:p/stop                    POST   /api/projects/:p/resume
+GET    /api/projects/:p/resources               # per-running-branch docker stats
+```
+
+`POST /api/projects` body: `{name, mount_point?, postgres_user?, postgres_password?, postgres_database?}`.  
+`PATCH /api/projects/:p` accepts the same shape (sans `name`) and persists to the project's config file — use it to fix a bad `mount_point` or rotate credentials.
+
+---
+
+## Configuration
+
+State lives under `~/.config/dbranch/`:
+
+```
+~/.config/dbranch/
+  registry.json              # {default: "...", projects: [...]}
+  projects/
+    my_app.json              # full Config for my_app
+    other.json
+```
+
+The first time dBranch runs in a directory holding a legacy
+`dbranch.config.json`, that file is migrated into the registry
+automatically and replaced by a small `{project: "..."}` pointer.
+
+### Environment variables
+
+| Variable           | Default                  | Purpose                                                                                                |
+|--------------------|--------------------------|--------------------------------------------------------------------------------------------------------|
+| `DBRANCH_HOME`     | `~/.config/dbranch`      | Override the dBranch home directory.                                                                   |
+| `DBRANCH_PROJECT`  | (registry default)       | Project to address when `--project` isn't passed.                                                      |
+| `DBRANCH_DATA`     | `$HOME/dbranch`          | Default mount-point suggested for new projects (point at a CoW volume for real reflinks).              |
+| `DBRANCH_CONFIG`   | `./dbranch.config.json`  | Legacy single-config path. Read by the migration shim.                                                 |
+| `DBRANCH_LOG`      | `info`                   | Log filter (same syntax as `RUST_LOG`, e.g. `dbranch=debug,info`). Falls back to `RUST_LOG` if unset.  |
+
+```bash
+DBRANCH_HOME=/tmp/dbranch-sandbox DBRANCH_LOG=debug dbranch start
+```
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         dBranch System                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                     CLI Interface                        │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐   │   │
-│  │  │   start  │  │  create  │  │   use    │  │  usage  │   │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └─────────┘   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                      Proxy Layer                         │   │
-│  │                                                          │   │
-│  │               PostgreSQL Proxy (Port 5432)               │   │
-│  │                           ↓                              │   │
-│  │            Routes to active branch container             │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                  Container Layer                         │   │
-│  │                                                          │   │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │
-│  │  │  Postgres   │  │  Postgres   │  │  Postgres   │       │   │
-│  │  │  main:5433  │  │ branch:5434 │  │ branch:5435 │       │   │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Storage Layer                         │   │
-│  │                                                          │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │                 COW Filesystem                      │ │   │
-│  │  │                ┌──────────────┐                     │ │   │
-│  │  │                │     main     │                     │ │   │
-│  │  │                ├──────────────┤                     │ │   │
-│  │  │                │   branch-1   │                     │ │   │
-│  │  │                ├──────────────┤                     │ │   │
-│  │  │                │   branch-2   │                     │ │   │
-│  │  │                └──────────────┘                     │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  CLI                Web UI (vanilla JS SPA, hash-routed)    │
+│   │                  │                                       │
+│   ▼                  ▼                                       │
+│  CliHandler         axum router  ─►  /api/* JSON endpoints   │
+│   └────────┬────────┘                                        │
+│            ▼                                                 │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ Domain modules                              │             │
+│  │   config       — Project + Registry         │             │
+│  │   snapshot     — copy_file_range / clonefile│             │
+│  │   database_op  — docker run / start / stop  │             │
+│  │   dump         — pg_dump / pg_restore       │             │
+│  │   schema       — psql introspection         │             │
+│  │   schema_diff  — pure diff function         │             │
+│  │   query        — safe psql -c executor      │             │
+│  │   docker_stats — CPU/mem/net/blk parser     │             │
+│  │   logbuf       — tracing → ring buffer      │             │
+│  └─────────────────────────────────────────────┘             │
+│            │                                                 │
+│            ▼                                                 │
+│  Docker (one container per branch)  +  Postgres data dirs    │
+│  (CoW-shared on BTRFS / XFS / APFS)                          │
+│                                                              │
+│  TCP proxy on :5432  ─►  active branch's published port      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Prerequisites
-
-- **Operating System**: Any with CoW filesystem support (e.g., Linux with BTRFS)
-- **Docker**: Installed and running
-- **Rust**: 1.70+ (for building from source)
-
-
-## Usage
-
-### Quick start
-
-```bash
-# Create a project (registers it in ~/.config/dbranch/registry.json)
-dbranch init -n my_app
-
-# Start the main Postgres container
-dbranch init-postgres
-
-# Create a branch (CoW snapshot of main)
-dbranch create feature-new-schema
-
-# Switch active branch — the proxy at :5432 follows
-dbranch use feature-new-schema
-
-# Open psql against any branch
-dbranch psql feature-new-schema
-
-# Get a connection URL
-dbranch url feature-new-schema
-
-# Dump / restore
-dbranch dump feature-new-schema -o /tmp/dump.dump
-dbranch import feature-new-schema -i /tmp/dump.dump
-
-# Start the proxy + Web UI (defaults: proxy 5432, UI/API 8000)
-dbranch start
-dbranch ui                      # opens http://localhost:8000
-
-# Multi-project: select with -p / --project
-dbranch -p other-project status
-```
-
-### CLI commands
-
-| Command                | What it does                                                |
-|------------------------|-------------------------------------------------------------|
-| `start`                | Postgres TCP proxy (`:5432`) + Web UI / JSON API (`:8000`). |
-| `init`                 | Register a new project.                                     |
-| `init-postgres`        | Create the project's `main` Postgres container.             |
-| `create <branch>`      | New CoW branch off `main`.                                  |
-| `use <branch>`         | Set active branch (proxy routes here).                      |
-| `list`                 | List registered projects.                                   |
-| `show <branch>`        | Detail a branch (port, size, container state, URL).         |
-| `delete <branch>`      | Drop a branch's container + data (refuses main / active).   |
-| `delete-project <p>`   | Drop the whole project and unregister it.                   |
-| `status`               | Project overview (branches, sizes, containers).             |
-| `stop` / `resume`      | Stop/resume all containers in the project.                  |
-| `dump <branch>`        | `pg_dump` to a host file (default format: custom).          |
-| `import <branch>`      | `pg_restore` a host file into a branch.                     |
-| `psql <branch>`        | Open `psql` against the branch (via `docker exec -it`).     |
-| `url <branch>`         | Print the connection URL.                                   |
-| `ui`                   | Open the Web UI in the default browser.                     |
-
-### Web UI
-
-Run `dbranch start`, then open `http://localhost:8000`. The UI exposes the same
-operations as the CLI: project list, branch creation, active switch, dump
-download, import upload, stop/resume, delete.
-
-All endpoints under `/api/`:
-
-```
-GET    /api/status                                    overview of every project
-GET    /api/defaults                                  suggested mount_point + pg creds
-GET    /api/projects                  POST /api/projects
-GET    /api/projects/:p               PATCH /api/projects/:p   DELETE /api/projects/:p
-GET    /api/projects/:p/branches                      POST /api/projects/:p/branches
-GET    /api/projects/:p/branches/:b   DELETE /api/projects/:p/branches/:b
-POST   /api/projects/:p/branches/:b/start             (idempotent — docker start if exists)
-POST   /api/projects/:p/branches/:b/stop
-POST   /api/projects/:p/active
-GET    /api/projects/:p/branches/:b/dump?format=custom
-POST   /api/projects/:p/branches/:b/import            (multipart `file`)
-POST   /api/projects/:p/stop                          POST /api/projects/:p/resume
-```
-
-`POST /api/projects` accepts `{name, mount_point?, postgres_user?, postgres_password?, postgres_database?}`.
-`PATCH /api/projects/:p` accepts the same shape (sans `name`) and persists changes to the project's config file. Use it to fix a broken `mount_point`, rotate credentials, or change the default database without dropping the project.
-
-## Configuration
-
-dBranch stores its state under `~/.config/dbranch/`:
-
-```
-~/.config/dbranch/
-  registry.json          # which projects exist + which is default
-  projects/
-    my_app.json          # full Config for `my_app`
-    other.json
-```
-
-The first time dBranch runs in a directory that has a legacy
-`dbranch.config.json`, the project is migrated into the registry automatically.
-
-### Environment variables
-
-All env vars are prefixed with `DBRANCH_`.
-
-| Variable            | Default                       | Purpose                                                                                                |
-|---------------------|-------------------------------|--------------------------------------------------------------------------------------------------------|
-| `DBRANCH_HOME`      | `~/.config/dbranch`           | Override the dBranch home directory (where the registry + projects live).                              |
-| `DBRANCH_PROJECT`   | (registry default)            | Default project for CLI commands when `--project` isn't passed.                                        |
-| `DBRANCH_CONFIG`    | `./dbranch.config.json`       | Legacy single-config path. Only used by the migration shim and a small back-compat code path.          |
-| `DBRANCH_LOG`       | `info`                        | Log filter (same syntax as `RUST_LOG`, e.g. `dbranch=debug,info`). Falls back to `RUST_LOG` if unset.  |
-
-Example:
-
-```bash
-DBRANCH_HOME=/tmp/dbranch-sandbox DBRANCH_LOG=debug dbranch -p sample list
-```
+---
 
 ## Testing
 
-Unit and integration tests run on any platform:
-
 ```bash
+# Unit + integration tests, no Docker required
 cargo test
-```
 
-End-to-end tests that require a real Docker daemon and a Linux filesystem with
-reflink support are gated behind `#[ignore]`:
-
-```bash
-# Linux only — needs Docker running
+# End-to-end smoke (needs Docker daemon reachable + Linux/macOS host)
 cargo test -- --ignored
 ```
 
-The mount point used by the e2e suite can be overridden with
-`DBRANCH_TEST_MOUNT` (default: `/tmp/dbranch-test`).
+A `DBRANCH_TEST_MOUNT` env var overrides the e2e suite's mount point
+(default `/tmp/dbranch-test`).
+
+---
 
 ## TODO
+
 - [X] Replace BTRFS module with direct syscall implementation
-- [X] Add support for additional filesystems with CoW support (e.g., ZFS)
-- [X] Add tests
-- [ ] MacOS support
+- [X] macOS support (via `clonefile(2)`)
+- [X] Web interface
+- [X] CoW filesystems beyond BTRFS (XFS, ext4-CoW, APFS)
+- [X] Tests (unit + integration + e2e)
+- [X] Schema view + branch diff + ER diagram
+- [X] Ad-hoc SQL terminal
+- [X] Multi-project
 - [ ] Windows support
-- [ ] Improve Postgres configuration to share more files between branches (e.g Disable auto vacuum and wall recycling)
-- [ ] Improve error handling and messages
 - [ ] Sync with remote postgres (optional)
-- [ ] Web interface to manage branches
+- [ ] Sharper postgres tuning for branches (autovacuum / WAL recycling)
+- [ ] Authentication / multi-user (currently single-user, localhost-only)
