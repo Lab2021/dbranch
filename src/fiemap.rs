@@ -24,41 +24,23 @@ pub enum FiemapFlags {
 
 impl FiemapFlags {
     pub fn from_bits(flags: u32) -> Vec<FiemapFlags> {
-        let mut result = Vec::new();
-        if flags & Self::Last as u32 != 0 {
-            result.push(Self::Last);
-        }
-        if flags & Self::Unknown as u32 != 0 {
-            result.push(Self::Unknown);
-        }
-        if flags & Self::Delalloc as u32 != 0 {
-            result.push(Self::Delalloc);
-        }
-        if flags & Self::Encoded as u32 != 0 {
-            result.push(Self::Encoded);
-        }
-        if flags & Self::DataCrypted as u32 != 0 {
-            result.push(Self::DataCrypted);
-        }
-        if flags & Self::NotAligned as u32 != 0 {
-            result.push(Self::NotAligned);
-        }
-        if flags & Self::DataInline as u32 != 0 {
-            result.push(Self::DataInline);
-        }
-        if flags & Self::DataTail as u32 != 0 {
-            result.push(Self::DataTail);
-        }
-        if flags & Self::Unwritten as u32 != 0 {
-            result.push(Self::Unwritten);
-        }
-        if flags & Self::Merged as u32 != 0 {
-            result.push(Self::Merged);
-        }
-        if flags & Self::Shared as u32 != 0 {
-            result.push(Self::Shared);
-        }
-        result
+        const ALL: &[FiemapFlags] = &[
+            FiemapFlags::Last,
+            FiemapFlags::Unknown,
+            FiemapFlags::Delalloc,
+            FiemapFlags::Encoded,
+            FiemapFlags::DataCrypted,
+            FiemapFlags::NotAligned,
+            FiemapFlags::DataInline,
+            FiemapFlags::DataTail,
+            FiemapFlags::Unwritten,
+            FiemapFlags::Merged,
+            FiemapFlags::Shared,
+        ];
+        ALL.iter()
+            .copied()
+            .filter(|f| flags & (*f as u32) != 0)
+            .collect()
     }
 }
 
@@ -111,10 +93,16 @@ pub struct Fiemap {
     pub flags: Vec<FiemapFlags>,
 }
 
+#[cfg(target_os = "linux")]
 pub fn check_file(f: File) -> Result<Vec<Fiemap>, AppError> {
     use std::os::fd::AsRawFd;
 
-    let file_size = f.metadata().unwrap().len();
+    let file_size = f
+        .metadata()
+        .map_err(|e| AppError::FileSystem {
+            message: format!("Failed to stat file: {}", e),
+        })?
+        .len();
     const FS_IOC_FIEMAP: u64 = nix::libc::_IOWR::<FiemapRequest>(0x66, 11);
 
     let mut all_extents: Vec<Fiemap> = Vec::new();
@@ -135,12 +123,6 @@ pub fn check_file(f: File) -> Result<Vec<Fiemap>, AppError> {
 
         if ret == -1 {
             let errno = std::io::Error::last_os_error();
-            eprintln!(
-                "FIEMAP ioctl failed: {} (errno: {}) (file_path: {:?})",
-                errno,
-                errno.raw_os_error().unwrap(),
-                f.metadata().unwrap()
-            );
             return Err(AppError::FileSystem {
                 message: format!("FIEMAP ioctl failed: {}", errno),
             });
@@ -174,6 +156,13 @@ pub fn check_file(f: File) -> Result<Vec<Fiemap>, AppError> {
     Ok(all_extents)
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn check_file(_f: File) -> Result<Vec<Fiemap>, AppError> {
+    Err(AppError::FileSystem {
+        message: "FIEMAP is only supported on Linux".into(),
+    })
+}
+
 pub struct FileInfo {
     pub real_size: u64,
     pub shared_size: u64,
@@ -188,57 +177,132 @@ pub struct FolderInfo {
 }
 
 pub fn get_folder_size(path: &Path) -> Option<FolderInfo> {
+    if !path.is_dir() {
+        return None;
+    }
+
     let mut fi = FolderInfo {
-        logical_size: 0u64,
-        shared_size: 0u64,
+        logical_size: 0,
+        shared_size: 0,
         files: Vec::new(),
     };
 
-    if path.is_dir() {
-        for entry in fs::read_dir(path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
 
-            if path.is_dir() {
-                let subfolder_info = get_folder_size(&path);
-                if let Some(subfolder) = subfolder_info {
-                    fi.logical_size += subfolder.logical_size;
-                    fi.shared_size += subfolder.shared_size;
-                    fi.files.extend(subfolder.files);
-                } else {
-                    continue;
-                }
-            } else {
-                let file_info = check_file(fs::File::open(&path).unwrap());
-                fi.logical_size += fs::metadata(&path).unwrap().len();
-                fi.shared_size += file_info
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .filter(|f| f.flags.contains(&FiemapFlags::Shared))
-                    .map(|f| f.extent.fe_length)
-                    .sum::<u64>();
-                fi.files.push(FileInfo {
-                    real_size: fs::metadata(&path).unwrap().len(),
-                    shared_size: file_info
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .filter(|f| f.flags.contains(&FiemapFlags::Shared))
-                        .map(|f| f.extent.fe_length)
-                        .sum::<u64>(),
-                    is_compressed: file_info
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .any(|f| f.flags.contains(&FiemapFlags::Encoded)),
-                    name: path.file_name().unwrap().to_string_lossy().to_string(),
-                });
+        if entry_path.is_dir() {
+            if let Some(sub) = get_folder_size(&entry_path) {
+                fi.logical_size += sub.logical_size;
+                fi.shared_size += sub.shared_size;
+                fi.files.extend(sub.files);
             }
+            continue;
         }
 
-        return Some(fi);
+        let metadata = match fs::metadata(&entry_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let real_size = metadata.len();
+
+        let extents = fs::File::open(&entry_path).ok().and_then(|f| check_file(f).ok());
+        let (shared_size, is_compressed) = match &extents {
+            Some(es) => (
+                es.iter()
+                    .filter(|f| f.flags.contains(&FiemapFlags::Shared))
+                    .map(|f| f.extent.fe_length)
+                    .sum::<u64>(),
+                es.iter().any(|f| f.flags.contains(&FiemapFlags::Encoded)),
+            ),
+            None => (0, false),
+        };
+
+        fi.logical_size += real_size;
+        fi.shared_size += shared_size;
+        fi.files.push(FileInfo {
+            real_size,
+            shared_size,
+            is_compressed,
+            name: entry_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        });
     }
 
-    None
+    Some(fi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn from_bits_extracts_individual_flags() {
+        let flags = FiemapFlags::from_bits(FiemapFlags::Last as u32);
+        assert_eq!(flags, vec![FiemapFlags::Last]);
+
+        let flags = FiemapFlags::from_bits(FiemapFlags::Shared as u32);
+        assert_eq!(flags, vec![FiemapFlags::Shared]);
+    }
+
+    #[test]
+    fn from_bits_combines_flags() {
+        let combined = FiemapFlags::Last as u32 | FiemapFlags::Shared as u32;
+        let flags = FiemapFlags::from_bits(combined);
+        assert!(flags.contains(&FiemapFlags::Last));
+        assert!(flags.contains(&FiemapFlags::Shared));
+        assert_eq!(flags.len(), 2);
+    }
+
+    #[test]
+    fn from_bits_returns_empty_for_zero() {
+        assert!(FiemapFlags::from_bits(0).is_empty());
+    }
+
+    #[test]
+    fn get_folder_size_returns_none_for_non_existing() {
+        assert!(get_folder_size(Path::new("/path/that/definitely/does/not/exist")).is_none());
+    }
+
+    #[test]
+    fn get_folder_size_returns_none_for_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+        assert!(get_folder_size(&file).is_none());
+    }
+
+    #[test]
+    fn get_folder_size_sums_logical_sizes() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+
+        let mut fa = std::fs::File::create(&a).unwrap();
+        fa.write_all(&[0u8; 100]).unwrap();
+        let mut fb = std::fs::File::create(&b).unwrap();
+        fb.write_all(&[0u8; 250]).unwrap();
+
+        let info = get_folder_size(dir.path()).unwrap();
+        assert_eq!(info.logical_size, 350);
+        assert_eq!(info.files.len(), 2);
+    }
+
+    #[test]
+    fn get_folder_size_recurses_into_subdirs() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        std::fs::write(dir.path().join("top.txt"), &[0u8; 10][..]).unwrap();
+        std::fs::write(sub.join("inner.txt"), &[0u8; 40][..]).unwrap();
+
+        let info = get_folder_size(dir.path()).unwrap();
+        assert_eq!(info.logical_size, 50);
+        assert_eq!(info.files.len(), 2);
+    }
 }

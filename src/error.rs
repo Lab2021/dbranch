@@ -66,4 +66,8 @@ pub enum AppError {
     // Command not implemented
     #[error("Command '{command}' is not implemented")]
     NotImplemented { command: String },
+
+    // Schema introspection requires a running branch container.
+    #[error("Branch '{branch}' container is not running; start it first")]
+    SchemaUnavailable { branch: String },
 }

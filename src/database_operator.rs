@@ -2,198 +2,166 @@ use std::path::Path;
 
 use docker_wrapper::{
     DockerCommand, InspectCommand, NetworkCreateCommand, NetworkLsCommand, RmCommand, RunCommand,
-    StopCommand,
+    StartCommand, StopCommand,
 };
 use tracing::{debug, info};
 
-use crate::{
-    config::{Branch, Config},
-    error::AppError,
-};
+use crate::{config::Config, error::AppError};
 
 pub trait DatabaseOperator {
-    async fn create_database(&self, config: Config, port: u16, name: &str) -> Result<(), AppError>;
-    async fn delete_database(&self, config: Config, name: &str) -> Result<(), AppError>;
-    async fn stop_database(&self, config: Config, name: &str) -> Result<(), AppError>;
-    async fn list_databases(&self, config: Config) -> Result<Vec<Branch>, AppError>;
-    async fn get_database_info(&self, config: Config, name: &str) -> Result<Branch, AppError>;
+    async fn create_database(&self, config: &Config, port: u16, name: &str)
+    -> Result<(), AppError>;
+    async fn delete_database(&self, config: &Config, name: &str) -> Result<(), AppError>;
+    async fn stop_database(&self, config: &Config, name: &str) -> Result<(), AppError>;
     async fn is_container_running(&self, name: &str) -> Result<bool, AppError>;
+    /// Idempotent: starts an existing stopped container, or creates a fresh
+    /// one if none exists. The right primitive for Resume / Init flows.
+    async fn start_or_create(&self, config: &Config, port: u16, name: &str)
+    -> Result<(), AppError>;
+    /// True if a container with this name exists (running or stopped).
+    async fn container_exists(&self, name: &str) -> Result<bool, AppError>;
 }
 
 pub struct PostgresOperator {}
 
 impl PostgresOperator {
     pub fn new() -> Self {
-        debug!("Creating new PostgresOperator instance");
         Self {}
     }
 }
 
+const DBRANCH_NETWORK: &str = "dbranch-network";
+const DEFAULT_DB_NAME: &str = "dbranch";
+
 impl DatabaseOperator for PostgresOperator {
-    async fn create_database(&self, config: Config, port: u16, name: &str) -> Result<(), AppError> {
+    async fn create_database(
+        &self,
+        config: &Config,
+        port: u16,
+        name: &str,
+    ) -> Result<(), AppError> {
         info!(
             "Creating PostgreSQL database '{}' for project '{}' on port {}",
             name, config.name, port
         );
 
-        debug!("Creating Docker network 'dbranch-network'");
+        ensure_network().await?;
 
-        let net = NetworkLsCommand::new()
-            .filter("name", "dbranch-network")
-            .execute()
-            .await
-            .map_err(|e| AppError::Docker {
-                message: format!("Failed to list Docker networks: {}", e),
-            })?;
-
-        if net.success && net.stdout.contains("dbranch-network") {
-            debug!("Docker network 'dbranch-network' already exists");
-        } else {
-            debug!("Docker network 'dbranch-network' does not exist, creating it");
-            let _ = NetworkCreateCommand::new("dbranch-network")
-                .execute()
-                .await
-                .map_err(|e| AppError::Docker {
-                    message: format!("Failed to create Docker network: {}", e),
-                })?;
-            debug!("Docker network created successfully");
-        }
-
-        let volume_path = Path::new(config.mount_point.clone().as_str())
+        let volume_path = Path::new(&config.mount_point)
             .join(&config.name)
-            .join(&name)
-            .join("data")
-            .to_string_lossy()
-            .into_owned();
+            .join(name)
+            .join("data");
 
-        std::fs::create_dir_all(volume_path.clone()).unwrap();
-        // https://github.com/docker-library/docs/tree/master/postgres#arbitrary---user-notes
-        std::os::unix::fs::chown(volume_path.clone(), Some(1000), Some(1000)).unwrap();
+        std::fs::create_dir_all(&volume_path).map_err(|e| AppError::FileSystem {
+            message: format!("Failed to create volume dir {:?}: {}", volume_path, e),
+        })?;
+
+        // Run the container as the host user so the bind-mounted volume is
+        // writable without root chown gymnastics. Works on any host:
+        // - Linux as the dev user: container writes show up as that user
+        // - macOS / Docker Desktop: same — Docker Desktop's VM maps the uid
+        // See https://github.com/docker-library/docs/tree/master/postgres#arbitrary---user-notes
+        // for postgres image's arbitrary-user support.
+        let uid = nix::unistd::Uid::current().as_raw();
+        let gid = nix::unistd::Gid::current().as_raw();
+        let user_arg = format!("{}:{}", uid, gid);
+
+        // Normalize ownership of the volume dir BEFORE postgres starts.
+        // Why this is required (and idempotent for fresh dirs):
+        //   - `snapshot()` on macOS uses `clonefile(2)`, which preserves the
+        //     source's uid/gid. If `main` was created by an earlier dBranch
+        //     build that ran the container as `1000:1000` (or a previous
+        //     user), the cloned branch inherits foreign ownership and the new
+        //     `--user uid:gid` postgres can't read/write its PGDATA.
+        //   - Same risk when the user moves data between machines.
+        // The one-shot `alpine chown` runs as root inside the VM and can
+        // always chown the bind mount, regardless of host-side permissions.
+        normalize_ownership(&volume_path, uid, gid).await?;
+
+        let pg = &config.postgres_config;
+        let db_name = pg.database.as_deref().unwrap_or(DEFAULT_DB_NAME);
+        let container_name = format!("{}_{}", config.name, name);
 
         debug!(
-            "Setting up PostgreSQL container with volume: {}",
-            volume_path
-        );
-        debug!(
-            "Container configuration: user={}, database={}",
-            config.postgres_config.clone().unwrap().user,
-            config
-                .postgres_config
-                .clone()
-                .unwrap()
-                .database
-                .as_ref()
-                .unwrap_or(&"dbranch".to_string())
+            "Setting up PostgreSQL container '{}' (user={}, db={}, volume={:?}, uid={})",
+            container_name, pg.user, db_name, volume_path, user_arg
         );
 
-        let _output = RunCommand::new("postgres:17-alpine")
-            .name(format!("{}_{}", config.name, name))
+        RunCommand::new("postgres:17-alpine")
+            .name(&container_name)
             .port(port, 5432)
-            .network("dbranch-network")
-            .user("1000:1000") // This allow the container to run with the host user permissions
-            .volume(volume_path, "/var/lib/postgresql/data")
-            .env(
-                "POSTGRES_USER",
-                config.postgres_config.clone().unwrap().user.as_str(),
+            .network(DBRANCH_NETWORK)
+            .user(&user_arg)
+            .volume(
+                volume_path.to_string_lossy().into_owned(),
+                "/var/lib/postgresql/data",
             )
-            .env(
-                "POSTGRES_PASSWORD",
-                config.postgres_config.clone().unwrap().password.as_str(),
-            )
-            .env(
-                "POSTGRES_DB",
-                config
-                    .postgres_config
-                    .clone()
-                    .unwrap()
-                    .database
-                    .clone()
-                    .or(Some("dbranch".into()))
-                    .unwrap(),
-            )
+            .env("POSTGRES_USER", &pg.user)
+            .env("POSTGRES_PASSWORD", &pg.password)
+            .env("POSTGRES_DB", db_name)
             .env("PGDATA", "/var/lib/postgresql/data/pgdata")
             .restart("no")
             .detach()
             .execute()
             .await
-            .unwrap();
+            .map_err(|e| AppError::Docker {
+                message: format!("Failed to run container {}: {}", container_name, e),
+            })?;
 
         info!(
             "PostgreSQL container '{}' created successfully on port {}",
-            name, port
+            container_name, port
         );
 
         Ok(())
     }
 
-    async fn delete_database(&self, config: Config, name: &str) -> Result<(), AppError> {
-        info!(
-            "Deleting PostgreSQL database '{}' for project '{}'",
-            name, config.name
-        );
+    async fn delete_database(&self, config: &Config, name: &str) -> Result<(), AppError> {
+        let container_name = format!("{}_{}", config.name, name);
+        info!("Deleting PostgreSQL container '{}'", container_name);
 
-        debug!("Stopping and removing PostgreSQL container: {}", name);
-
-        let stop_output = StopCommand::new(format!("{}_{}", config.name, name))
+        let stop_output = StopCommand::new(&container_name)
             .execute()
             .await
             .map_err(|e| AppError::Docker {
-                message: format!(
-                    "Failed to stop Docker container {}: {}",
-                    format!("{}_{}", config.name, name),
-                    e
-                ),
+                message: format!("Failed to stop container {}: {}", container_name, e),
             })?;
 
-        if !(stop_output.is_success()) {
+        if !stop_output.is_success() {
             debug!(
                 "Container {} might already be stopped: {}",
-                name, stop_output.stderr
+                container_name, stop_output.stderr
             );
-        } else {
-            info!("Container {} stopped successfully", name);
         }
 
-        let rm_output = RmCommand::new(format!("{}_{}", config.name, name))
+        let rm_output = RmCommand::new(&container_name)
             .volumes()
             .execute()
             .await
             .map_err(|e| AppError::Docker {
-                message: format!(
-                    "Failed to remove Docker container {}: {}",
-                    format!("{}_{}", config.name, name),
-                    e
-                ),
+                message: format!("Failed to remove container {}: {}", container_name, e),
             })?;
 
-        if !(rm_output.removed_contexts().len() > 0) {
+        if rm_output.removed_contexts().is_empty() {
             debug!(
-                "Container {} might already be stopped: {}",
-                name, rm_output.stderr
+                "Container {} might already be removed: {}",
+                container_name, rm_output.stderr
             );
-        } else {
-            info!("Container {} stopped successfully", name);
         }
 
-        info!("PostgreSQL container '{}' deleted successfully", name);
+        info!("PostgreSQL container '{}' deleted successfully", container_name);
         Ok(())
     }
 
-    async fn stop_database(&self, config: Config, name: &str) -> Result<(), AppError> {
+    async fn stop_database(&self, config: &Config, name: &str) -> Result<(), AppError> {
         let container_name = format!("{}_{}", config.name, name);
+        info!("Stopping PostgreSQL container '{}'", container_name);
 
-        info!(
-            "Stopping PostgreSQL database '{}' for project '{}'",
-            container_name, config.name
-        );
-
-        debug!("Stopping PostgreSQL container: {}", container_name);
-
-        let stop_output = StopCommand::new(container_name.clone())
+        let stop_output = StopCommand::new(&container_name)
             .execute()
             .await
             .map_err(|e| AppError::Docker {
-                message: format!("Failed to stop Docker container {}: {}", container_name, e),
+                message: format!("Failed to stop container {}: {}", container_name, e),
             })?;
 
         if !stop_output.is_success() {
@@ -205,51 +173,127 @@ impl DatabaseOperator for PostgresOperator {
             info!("Container {} stopped successfully", container_name);
         }
 
-        info!(
-            "PostgreSQL container '{}' stopped successfully",
-            container_name
-        );
         Ok(())
-    }
-
-    async fn list_databases(&self, config: Config) -> Result<Vec<Branch>, AppError> {
-        debug!("Listing PostgreSQL databases for project '{}'", config.name);
-        // TODO: Implement logic to list PostgreSQL databases here
-        Ok(vec![])
-    }
-
-    async fn get_database_info(&self, config: Config, name: &str) -> Result<Branch, AppError> {
-        debug!(
-            "Getting database info for '{}' in project '{}'",
-            name, config.name
-        );
-        // TODO: Implement logic to get information about a specific PostgreSQL database here
-        Err(AppError::NotImplemented {
-            command: "get_database_info".into(),
-        })
     }
 
     async fn is_container_running(&self, name: &str) -> Result<bool, AppError> {
         debug!("Checking if container '{}' is running", name);
 
-        let inspect_output = InspectCommand::new(name).execute().await;
-
-        match inspect_output {
-            Ok(output) => {
-                if output.success && !output.stdout.is_empty() {
-                    let is_running = output.stdout.contains("\"Running\":true")
-                        || output.stdout.contains("\"Running\": true");
-                    debug!("Container '{}' running status: {}", name, is_running);
-                    Ok(is_running)
-                } else {
-                    debug!("Container '{}' not found or inspect failed", name);
-                    Ok(false)
-                }
+        match InspectCommand::new(name).execute().await {
+            Ok(output) if output.success && !output.stdout.is_empty() => {
+                let is_running = output.stdout.contains("\"Running\":true")
+                    || output.stdout.contains("\"Running\": true");
+                Ok(is_running)
             }
-            Err(e) => {
-                debug!("Failed to inspect container '{}': {}", name, e);
-                Ok(false)
-            }
+            _ => Ok(false),
         }
     }
+
+    async fn container_exists(&self, name: &str) -> Result<bool, AppError> {
+        match InspectCommand::new(name).execute().await {
+            Ok(output) => Ok(output.success && !output.stdout.is_empty()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn start_or_create(
+        &self,
+        config: &Config,
+        port: u16,
+        name: &str,
+    ) -> Result<(), AppError> {
+        let container = format!("{}_{}", config.name, name);
+
+        if self.is_container_running(&container).await.unwrap_or(false) {
+            debug!("Container '{}' already running; nothing to do", container);
+            return Ok(());
+        }
+
+        if self.container_exists(&container).await.unwrap_or(false) {
+            info!("Starting existing container '{}'", container);
+            let out = StartCommand::new(&container)
+                .execute()
+                .await
+                .map_err(|e| AppError::Docker {
+                    message: format!("Failed to start container {}: {}", container, e),
+                })?;
+            if !out.is_success() {
+                return Err(AppError::Docker {
+                    message: format!("Container {} did not start: {}", container, out.stderr),
+                });
+            }
+            return Ok(());
+        }
+
+        self.create_database(config, port, name).await
+    }
+}
+
+async fn ensure_network() -> Result<(), AppError> {
+    let net = NetworkLsCommand::new()
+        .filter("name", DBRANCH_NETWORK)
+        .execute()
+        .await
+        .map_err(|e| AppError::Docker {
+            message: format!("Failed to list Docker networks: {}", e),
+        })?;
+
+    if net.success && net.stdout.contains(DBRANCH_NETWORK) {
+        debug!("Docker network '{}' already exists", DBRANCH_NETWORK);
+        return Ok(());
+    }
+
+    debug!("Creating Docker network '{}'", DBRANCH_NETWORK);
+    NetworkCreateCommand::new(DBRANCH_NETWORK)
+        .execute()
+        .await
+        .map_err(|e| AppError::Docker {
+            message: format!("Failed to create Docker network: {}", e),
+        })?;
+    Ok(())
+}
+
+/// Recursively chown a bind-mount path inside an ephemeral `alpine`
+/// container (which runs as root and can therefore chown anything in the
+/// mount, even files owned by foreign UIDs).
+///
+/// The call is idempotent — if ownership is already correct, `chown` is a
+/// no-op. It typically completes in ~200ms once alpine is cached locally.
+async fn normalize_ownership(
+    host_path: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), AppError> {
+    let host = host_path.to_string_lossy().into_owned();
+    debug!("Normalizing ownership of {} to {}:{}", host, uid, gid);
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "-v",
+            &format!("{}:/data", host),
+            "alpine:3",
+            "chown",
+            "-R",
+            &format!("{}:{}", uid, gid),
+            "/data",
+        ])
+        .output()
+        .await
+        .map_err(|e| AppError::Docker {
+            message: format!("Failed to spawn alpine chown: {}", e),
+        })?;
+    if !out.status.success() {
+        return Err(AppError::Docker {
+            message: format!(
+                "chown of {:?} failed (status {}): {}",
+                host_path,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        });
+    }
+    Ok(())
 }

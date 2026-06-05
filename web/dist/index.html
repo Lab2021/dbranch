@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🌿 dBranch</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header id="chrome">
+    <nav id="breadcrumbs"></nav>
+    <div id="header-actions"></div>
+  </header>
+
+  <main id="app"></main>
+
+  <template id="branch-row-tpl">
+    <tr>
+      <td class="branch-name"></td>
+      <td class="branch-port"></td>
+      <td class="branch-size"></td>
+      <td class="branch-unique"></td>
+      <td class="branch-status"></td>
+      <td class="branch-url"></td>
+      <td class="branch-actions"></td>
+    </tr>
+  </template>
+
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
